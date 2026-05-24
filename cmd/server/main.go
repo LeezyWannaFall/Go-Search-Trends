@@ -23,6 +23,9 @@ func main() {
 	// router
 	r := chi.NewRouter()
 	r.Get("/top", h.GetTop)
+	r.Post("/stoplist/{word}", h.AddWord)
+	r.Delete("/stoplist/{word}", h.DeleteWord)
+	r.Get("/stoplist", h.GetBlackList)
 
 	// server
 	go func() {

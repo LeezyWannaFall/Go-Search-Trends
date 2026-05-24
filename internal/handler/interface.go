@@ -7,4 +7,7 @@ import (
 
 type TrendingServiceHandler interface {
     GetTop(ctx context.Context, n int) []model.TopEntry
+	AddWord(ctx context.Context, word string)
+	DeleteWord(ctx context.Context, word string)
+	GetBlackList(ctx context.Context) []string
 }

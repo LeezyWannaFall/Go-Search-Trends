@@ -32,6 +32,7 @@ services:
       interval: 10s
       timeout: 10s
       retries: 10
+      start_period: 30s
     volumes:
       - kafka_data:/var/lib/kafka/data
 

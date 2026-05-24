@@ -9,16 +9,18 @@ import (
 	"github.com/LeezyWannaFall/Go-Search-Trends/internal/model"
 )
 
+type bucket map[string]map[string]struct{}
+
 type TrendingService struct {
 	mu       sync.RWMutex
-	buckets  map[int64]map[string]int
+	buckets  map[int64]bucket
 	stopList map[string]struct{}
     lastCleanup int64
 }
 
 func New() *TrendingService {
 	return &TrendingService{
-		buckets:  make(map[int64]map[string]int),
+		buckets:  make(map[int64]bucket),
 		stopList: make(map[string]struct{}),
 	}
 }
@@ -35,19 +37,20 @@ func (s *TrendingService) Add(ctx context.Context, event model.SearchEvent) {
 
     s.mu.Lock()
     if _, ok := s.buckets[currMin]; !ok {
-        s.buckets[currMin] = make(map[string]int)
+        s.buckets[currMin] = make(bucket)
     }
-    s.buckets[currMin][event.Query]++
+
+    if _, ok := s.buckets[currMin][event.Query]; !ok {
+        s.buckets[currMin][event.Query] = make(map[string]struct{})
+    }
+
+    s.buckets[currMin][event.Query][event.UserID] = struct{}{}
     s.mu.Unlock()
 
     s.cleanupOldBuckets()
 }
 
 func (s *TrendingService) GetTop(ctx context.Context, n int) []model.TopEntry {
-	if n <= 0 {
-        return nil
-    }
-
     var top []model.TopEntry
 
     tNow := time.Now()
@@ -61,7 +64,7 @@ func (s *TrendingService) GetTop(ctx context.Context, n int) []model.TopEntry {
         }
 
         for query, cnt := range bucket {
-            counts[query] += cnt
+            counts[query] += len(cnt)
         }
     }
     s.mu.RUnlock()
@@ -82,4 +85,30 @@ func (s *TrendingService) GetTop(ctx context.Context, n int) []model.TopEntry {
     }
 
     return top
+}
+
+func (s *TrendingService) AddWord(ctx context.Context, word string) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    s.stopList[word] = struct{}{}
+}
+
+func (s *TrendingService) DeleteWord(ctx context.Context, word string) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    delete(s.stopList, word)
+}
+
+func (s *TrendingService) GetBlackList(ctx context.Context) []string {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+
+	blacklist := make([]string, 0, len(s.stopList))
+    for word := range s.stopList {
+        blacklist = append(blacklist, word)
+    }
+
+    return blacklist
 }
