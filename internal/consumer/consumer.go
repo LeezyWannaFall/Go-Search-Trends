@@ -42,7 +42,8 @@ func (c *Consumer) Run(ctx context.Context) {
             log.Printf("failed to parse message: %v", err)
             continue
         }
-
+        
+        log.Printf("added event: query=%s", event.Query)
         c.service.Add(ctx, event)
     }
 }
