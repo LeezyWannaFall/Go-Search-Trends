@@ -2,7 +2,10 @@ module github.com/LeezyWannaFall/Go-Search-Trends
 
 go 1.26.3
 
-require github.com/segmentio/kafka-go v0.4.51
+require (
+	github.com/go-chi/chi/v5 v5.3.0
+	github.com/segmentio/kafka-go v0.4.51
+)
 
 require (
 	github.com/klauspost/compress v1.15.9 // indirect

@@ -1,9 +1,11 @@
 package model
 
+import "time"
+
 type SearchEvent struct {
     Query     string `json:"query"`
     UserID    string `json:"user_id"`
-    Timestamp string `json:"timestamp"`
+    Timestamp time.Time `json:"timestamp"`
 }
 
 type TopEntry struct {
