@@ -11,7 +11,7 @@ import (
 
 type TrendingService struct {
 	mu       sync.RWMutex
-	buckets  map[int64]map[string]int // ключ = unix timestamp минуты
+	buckets  map[int64]map[string]int
 	stopList map[string]struct{}
     lastCleanup int64
 }
@@ -51,7 +51,7 @@ func (s *TrendingService) GetTop(ctx context.Context, n int) []model.TopEntry {
     var top []model.TopEntry
 
     tNow := time.Now()
-    border := (tNow.Unix() / 60) - 4
+    border := (tNow.Unix() / 60) - 5
     counts := make(map[string]int)
 
     s.mu.RLock()

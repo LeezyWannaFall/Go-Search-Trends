@@ -6,7 +6,7 @@ import (
 
 func (s *TrendingService) cleanupOldBuckets() {
 	tNow := time.Now().Unix() / 60
-	border := tNow - 4
+	border := tNow - 5
 
 	s.mu.Lock()
 	if tNow == s.lastCleanup {
