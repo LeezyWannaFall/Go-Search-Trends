@@ -1,42 +1,193 @@
 # Go Search Trends
 
-Сервис для отображения актуальных трендов поиска в реальном времени. Читает поток поисковых событий из Kafka и отдаёт топ-N самых популярных запросов за последние 5 минут.
+A high-throughput Go backend service that consumes search events from Kafka and exposes the **Top-N trending queries over a rolling 5-minute window**.
 
----
+The project focuses on read-heavy workloads, low-latency in-memory aggregation, concurrent access, and explicit engineering trade-offs.
 
-## Быстрый запуск
+## Highlights
 
-**Требования:** Docker, Docker Compose.
+- Real-time search event processing with **Apache Kafka**
+- Rolling 5-minute Top-N query aggregation
+- Counts **unique users per query** instead of raw request volume to reduce simple spam/bot amplification
+- In-memory minute buckets optimized for fast reads
+- Concurrent access with `sync.RWMutex`
+- Runtime stop-list management through REST endpoints
+- Docker Compose setup for local development
 
-```bash
-git clone https://github.com/LeezyWannaFall/Go-Search-Trends.git
-cd Go-Search-Trends
-docker compose up --build
+## Tech Stack
+
+- **Go**
+- **Apache Kafka**
+- **Docker / Docker Compose**
+- **REST / JSON**
+- Go standard library synchronization primitives
+
+## How It Works
+
+Search events are published to the Kafka topic `search-events`.
+
+Example event:
+
+```json
+{
+  "query": "golang",
+  "user_id": "user-42",
+  "timestamp": "2026-05-25T12:00:00Z"
+}
 ```
 
-Сервис поднимается на `http://localhost:8080`.
+The service consumes the events, places them into minute-based in-memory buckets, and exposes the most popular queries from the active 5-minute window.
 
----
+Popularity is based on the number of **unique `user_id` values**, not on the total number of requests. A single user sending the same query thousands of times within a minute therefore contributes a weight of `1`.
+
+## Architecture
+
+```text
+                         +------------------+
+                         |  Search Events   |
+                         +--------+---------+
+                                  |
+                                  v
+                         +------------------+
+                         |      Kafka       |
+                         |  search-events   |
+                         +--------+---------+
+                                  |
+                                  v
+                    +---------------------------+
+                    |     Go Consumer / API     |
+                    |                           |
+                    |  Event validation         |
+                    |  Minute bucket storage    |
+                    |  Unique-user aggregation  |
+                    |  Stop-list filtering      |
+                    +-------------+-------------+
+                                  |
+                    +-------------+-------------+
+                    |                           |
+                    v                           v
+             +-------------+            +-------------+
+             | GET /top    |            | Stop-list   |
+             | Top-N API   |            | REST API    |
+             +-------------+            +-------------+
+```
+
+The main in-memory structure is conceptually:
+
+```go
+map[int64]map[string]map[string]struct{}
+```
+
+where:
+
+```text
+minute -> query -> set of unique user IDs
+```
+
+Example:
+
+```text
+minute N-2:
+  golang -> {u1, u2, u3}
+  kafka  -> {u1, u5}
+
+minute N-1:
+  golang -> {u2, u4}
+  redis  -> {u3}
+
+minute N:
+  golang -> {u1}
+  docker -> {u2, u6, u7}
+```
+
+The outer key is `unix_timestamp / 60`.
+
+## Why Minute Buckets?
+
+The service only needs a short rolling history.
+
+Using minute buckets gives direct access to the relevant time interval without storing every event indefinitely. It also makes old data inexpensive to discard.
+
+A map was chosen instead of a slice because events arrive with timestamps and the corresponding minute bucket can be accessed directly without scanning for an index.
+
+## Concurrency
+
+The workload is expected to be heavily read-oriented, with reads occurring roughly **10-50x more often than writes**.
+
+The in-memory store uses `sync.RWMutex`:
+
+- multiple `GET /top` requests can read concurrently;
+- event ingestion acquires an exclusive lock only when modifying state.
+
+This keeps the synchronization model simple while allowing concurrent readers.
+
+## Top-N Strategy
+
+The project intentionally does **not** maintain a heap or priority queue on every write.
+
+A heap would make Top-N reads cheaper, but every incoming event could require maintaining ordering state. For a workload with significantly more reads than writes, the current implementation favors simple writes and computes ordering when Top-N data is requested.
+
+This is a deliberate trade-off rather than an assumption that one data structure is universally faster.
+
+## Why In-Memory Instead of Redis?
+
+The trending data is intentionally short-lived and only relevant for a few minutes.
+
+For the scope of this service:
+
+- persistence is not required;
+- local memory avoids an additional network hop;
+- the implementation stays small and predictable.
+
+A distributed deployment would require a different design, such as shared state, partitioned aggregation, or an external data store. The current implementation optimizes for a single service instance and low read latency.
+
+## Event Time vs. Processing Time
+
+The rolling window uses the event's `timestamp`, rather than the time at which the Kafka consumer receives it.
+
+This means the ranking reflects when the search actually happened instead of when it happened to reach the consumer.
+
+Trade-off: a producer with an incorrect clock or a significantly delayed event can place data into the wrong bucket. For this project, event time was chosen because it better represents real search activity.
+
+## Basic Abuse Resistance
+
+A plain counter such as:
+
+```go
+map[string]int
+```
+
+would allow one client to increase the rank of a query by repeatedly sending the same event.
+
+Instead, each query stores a set of user IDs for each minute:
+
+```go
+map[string]struct{}
+```
+
+The query weight is therefore the number of unique users in the bucket.
+
+This protects against repeated events from one fixed user ID, but it does **not** solve distributed abuse from many identities. More advanced protection could include velocity checks, IP-based limits, or behavioral analysis.
 
 ## API
 
-### GET /top
+### `GET /top`
 
-Возвращает топ-N самых популярных поисковых запросов за последние 5 минут.
+Returns the Top-N search queries from the active rolling window.
 
-**Параметры:**
+Query parameter:
 
-| Параметр | Тип | Описание                     | По умолчанию |
-|----------|-----|------------------------------|--------------|
-| `n`      | int | Количество запросов в ответе | 10           |
+| Parameter | Type | Default | Description |
+|---|---:|---:|---|
+| `n` | int | `10` | Number of queries to return |
 
-**Пример запроса:**
+Example:
 
 ```bash
 curl "http://localhost:8080/top?n=5"
 ```
 
-**Пример ответа:**
+Response:
 
 ```json
 [
@@ -46,175 +197,99 @@ curl "http://localhost:8080/top?n=5"
 ]
 ```
 
-При отсутствии данных за последние 5 минут возвращается `null`.
+If there is no data in the active window, the endpoint currently returns `null`.
 
----
+### `POST /stoplist/{word}`
 
-### POST /stoplist/{word}
-
-Добавляет слово в стоп-лист. Запросы с этим словом перестают попадать в топ немедленно, без перезапуска сервиса.
+Adds a word to the stop list. Matching queries are excluded immediately without restarting the service.
 
 ```bash
-curl -X POST "http://localhost:8080/stoplist/спам"
+curl -X POST "http://localhost:8080/stoplist/spam"
 ```
 
-Ответ: `204 No Content`
+Response:
 
----
+```text
+204 No Content
+```
 
-### DELETE /stoplist/{word}
+### `DELETE /stoplist/{word}`
 
-Удаляет слово из стоп-листа.
+Removes a word from the stop list.
 
 ```bash
-curl -X DELETE "http://localhost:8080/stoplist/спам"
+curl -X DELETE "http://localhost:8080/stoplist/spam"
 ```
 
-Ответ: `204 No Content`
+### `GET /stoplist`
 
----
-
-### GET /stoplist
-
-Возвращает текущий список заблокированных слов.
+Returns the current stop list.
 
 ```bash
 curl "http://localhost:8080/stoplist"
 ```
 
-**Пример ответа:**
+Example response:
 
 ```json
-["спам", "реклама"]
+["spam", "ads"]
 ```
 
----
+## Running Locally
 
-## Тестовая отправка событий
+Requirements:
 
-Подключиться к Kafka-продюсеру внутри контейнера:
+- Docker
+- Docker Compose
+
+Clone and start the service:
 
 ```bash
-docker compose exec kafka \
-  kafka-console-producer --bootstrap-server localhost:9092 --topic search-events
+git clone https://github.com/LeezyWannaFall/Go-Search-Trends.git
+cd Go-Search-Trends
+docker compose up --build
 ```
 
-Ввести событие в формате JSON и нажать Enter:
+The API will be available at:
 
-```json
-{"query":"golang","user_id":"u1","timestamp":"2026-05-25T12:00:00Z"}
+```text
+http://localhost:8080
 ```
 
-> ⚠️ Поле `timestamp` должно содержать **текущее время** — сервис хранит только данные за последние 5 минут. События с устаревшим временем будут получены, но не попадут в топ.
+## Data Contract
 
----
+Kafka topic:
 
-## Контракт данных
-
-### Формат сообщения в Kafka (topic: `search-events`)
-
-```json
-{
-  "query":     "golang",
-  "user_id":   "user-42",
-  "timestamp": "2026-05-25T12:00:00Z"
-}
+```text
+search-events
 ```
 
-| Поле        | Тип              | Обязательное | Описание                            |
-|-------------|------------------|:------------:|-------------------------------------|
-| `query`     | string           | ✅            | Текст поискового запроса            |
-| `user_id`   | string           | ✅            | Идентификатор пользователя          |
-| `timestamp` | string, RFC 3339 | ✅            | Время совершения поискового запроса |
+Message schema:
 
-### Обоснование полей
+| Field | Type | Required | Description |
+|---|---|:---:|---|
+| `query` | string | Yes | Search query text |
+| `user_id` | string | Yes | User identifier used for unique-user counting |
+| `timestamp` | RFC 3339 string | Yes | Time at which the search event occurred |
 
-**`query`** — основная единица данных. Именно по нему считается частота и строится топ.
+## Known Trade-offs
 
-**`user_id`** — ключевое поле для защиты от накрутки. Внутри каждого минутного бакета запросы от одного пользователя хранятся как множество (`map[string]struct{}`), поэтому вес запроса в топе — это количество **уникальных пользователей**, а не суммарное число обращений. Один бот с фиксированным `user_id` может слать тысячи одинаковых запросов в минуту, но в топе он будет засчитан как `1`.
+### Rolling-window precision
 
-**`timestamp`** — время совершения поиска **на стороне продуцирующего сервиса**, не время получения события. Это принципиально: сервис строит скользящее окно по реальному времени поиска. Если использовать время получения (server-side), задержки в Kafka или сетевые лаги исказят окно. RFC 3339 выбран как стандарт с поддержкой таймзон — это позволяет корректно принимать события из разных регионов.
+The implementation uses minute granularity rather than storing every event at second-level precision.
 
----
+This keeps the model simple and memory-efficient, but the effective window is approximate rather than an exact 300-second interval.
 
-## Архитектура и выбор структур данных
+### Distributed scaling
 
-### Основное хранилище: минутные бакеты
+The aggregation state lives in process memory, so multiple independent replicas would not automatically share ranking state.
 
-Тип: `map[int64]map[string]map[string]struct{}`
+A production distributed version would need an explicit partitioning/aggregation strategy or shared storage.
 
-```
-buckets = {
-  29659854: {                            // минута N-2
-    "golang": {"u1":{}, "u2":{}, "u3":{}},
-    "kafka":  {"u1":{}, "u5":{}},
-  },
-  29659855: {                            // минута N-1
-    "golang": {"u2":{}, "u4":{}},
-    "redis":  {"u3":{}},
-  },
-  29659856: {                            // минута N (текущая)
-    "golang": {"u1":{}},
-    "docker": {"u2":{}, "u6":{}, "u7":{}},
-  },
-}
-```
+### Abuse prevention
 
-Ключ внешней map — `unix_timestamp / 60`, то есть номер минуты с начала эпохи. Для каждого запроса внутри бакета хранится **множество уникальных `user_id`**. Вес запроса в топе — `len()` этого множества.
+Unique-user counting prevents trivial repeated requests from a single identity, but it does not prevent coordinated or distributed abuse.
 
-**Почему не `map[string]int` (простой счётчик)?** Простой счётчик суммирует все обращения, включая повторные от одного пользователя или бота. Множество `user_id` даёт защиту от накрутки без дополнительного слоя логики.
+### Producer clock accuracy
 
-**Почему не `[]bucket` (слайс)?** Слайс требует знать индекс нужной минуты или линейного поиска. Map даёт O(1) доступ к бакету нужной минуты.
-
-**Почему не heap/priority queue?** Heap ускоряет `GetTop`, но усложняет `Add` — каждая запись требует пересчёта позиции. При соотношении записей и чтений 1:10–50 это не оправдано: проще пересортировать при чтении, чем поддерживать порядок при каждой записи.
-
-**Почему не Redis Sorted Set?** Задача не требует персистентности — данные актуальны только 5 минут. Добавление Redis создаёт сетевую задержку на каждое чтение, что противоречит требованию "максимально быстро". In-memory решение даёт задержку в наносекундах.
-
-### Конкурентный доступ: `sync.RWMutex`
-
-По требованиям ТЗ чтений в 10–50 раз больше, чем записей. `RWMutex` позволяет любому количеству горутин читать одновременно — `GetTop` не блокирует другие `GetTop`. Только `Add` (запись) захватывает эксклюзивную блокировку.
-
-### Стоп-лист: `map[string]struct{}`
-
-`struct{}` не занимает памяти — это идиоматичный Go-способ реализовать множество. Проверка принадлежности — O(1). Управление стоп-листом реализовано через API (`POST /stoplist/{word}`, `DELETE /stoplist/{word}`) и применяется мгновенно без перезапуска сервиса.
-
----
-
-## Нагрузочное тестирование
-
-Инструмент: [hey](https://github.com/rakyll/hey)
-
-```bash
-hey -n 10000 -c 100 "http://localhost:8080/top?n=10"
-```
-
-![Benchmark](docs/benchmark.png)
-
-| Метрика | Значение |
-|---|---|
-| Requests/sec | 52 954 |
-| Среднее время ответа | 1.8ms |
-| p50 | 1.1ms |
-| p99 | 18ms |
-| Успешных ответов | 10 000 / 10 000 (200 OK) |
-
-Сервис обрабатывает ~53 000 запросов в секунду на локальной машине,
-что соответствует требованию highload с перекосом чтений 10-50x.
-
----
-
-## Trade-offs и решения по бизнес-логике
-
-### Проблемы, выявленные в постановке
-
-**1. «Последние 5 минут» — неточное определение**
-
-Неясно: это ровно 300 секунд или 5 полных минутных окон? Решение: скользящее окно с минутной гранулярностью. Каждая минута — отдельный бакет. В топ включаются все бакеты с номером минуты `>= (текущая_минута - 5)`. Это чуть менее точно (эффективное окно — от ~4 до ~5 минут в зависимости от момента запроса), но значительно проще в реализации и не требует хранения событий с точностью до секунды. Для виджета "Сейчас ищут" такая погрешность незаметна пользователю.
-
-**2. Аномальные всплески — нет количественного определения**
-
-ТЗ упоминает "конкурентов и парсеров", но не определяет порог отсечения. Реализованное решение: вес запроса в топе — количество **уникальных пользователей** (`user_id`), а не суммарный счётчик. Это нейтрализует накрутку с одного аккаунта. Компромисс: распределённые боты с разными `user_id` по-прежнему могут влиять на топ. Для более глубокой защиты потребовался бы анализ поведенческих паттернов (velocity check, IP rate limiting), что выходит за рамки данного сервиса.
-
-**3. Время события vs. время получения**
-
-Выбрано время события (`event.Timestamp`). Компромисс: если продуцирующий сервис отправляет события с задержкой или неправильными часами, они попадут в некорректный бакет. Альтернатива — использовать `time.Now()` на стороне консьюмера, но тогда теряется смысл поля `timestamp` и окно перестаёт отражать реальную картину поисков. При нормальной работе инфраструктуры задержки в Kafka измеряются миллисекундами и не влияют на попадание в минутный бакет.
+Because ranking uses event time, incorrect producer clocks can affect bucket placement.
